@@ -18,27 +18,8 @@ const os = require('node:os')
 const path = require('node:path')
 const { exec } = require('node:child_process')
 
-// 宿主地址在启动时「发现」出来，不再写死 —— 与 macOS 版保持一致：
-// 官方桌面版（Electron，端口由宿主决定，实测 19387）和手动起的 `dsh web`（3080）都要能连上。
-const CANDIDATE_BASES = [
-  'http://127.0.0.1:19387',
-  'http://127.0.0.1:3080',
-  'http://127.0.0.1:8080',
-  'http://127.0.0.1:3000',
-]
-let petBase = CANDIDATE_BASES[0]
-
-/** 通行证文件里记录的宿主端口（插件写的，因机器而异 —— 不能写死） */
-function deskPort() {
-  try {
-    const j = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'))
-    const n = Number(j.port)
-    return Number.isInteger(n) && n > 0 && n < 65536 ? n : null
-  } catch (e) {
-    return null
-  }
-}
-const petURL = () => petBase + '/dsh-pet/standalone'
+const PET_URL = 'http://127.0.0.1:3080/dsh-pet/standalone'
+const ORIGIN = 'http://127.0.0.1:3080'
 const PLUGIN = 'github:Andersen216/dsh-whale-girl-live2d'
 // 同 macOS：窗口要装得下她 + 四周的面板（透明区域点击穿透，不挡别的窗口）
 const WIN_W = 560
@@ -52,6 +33,7 @@ let tray = null
 let pollTimer = null
 let dragTimer = null
 let dragFrom = null
+let ballDrag = null   // 本地补丁 v4：贴边小球专用（原来和主窗口共用 dragFrom ✗ 会崩）
 let collapsed = false
 let lowPower = false
 let overPanel = false
@@ -75,7 +57,7 @@ async function setTokenCookie() {
   if (!token) return false
   try {
     await session.defaultSession.cookies.set({
-      url: petBase,
+      url: ORIGIN,
       name: 'dsh_pet_desk',
       value: token,
       domain: '127.0.0.1',
@@ -150,7 +132,7 @@ function createMain() {
   win.setMenuBarVisibility(false)
 
   const wa = screen.getPrimaryDisplay().workArea
-  const saved = readPos()
+  const saved = clampToDisplays(readPos())
   win.setPosition(saved ? saved[0] : wa.x + wa.width - WIN_W - 8, saved ? saved[1] : wa.y + wa.height - WIN_H - 8)
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -168,22 +150,35 @@ function createMain() {
     if (failCount >= 3) showHint()
     setTimeout(load, 5000)
   })
-  win.on('moved', savePos)
+  // 本地补丁 v3：窗口只要越界就拉回来；写盘节流到 400ms（原来每 16ms 一次 ✗）
+  win.on('moved', () => {
+    if (!win || win.isDestroyed()) return
+    const [x, y] = win.getPosition()
+    const [cx, cy] = clampToDisplayUnion(x, y)
+    if (cx !== x || cy !== y) win.setPosition(cx, cy)
+    const now = Date.now()
+    if (now - (globalThis.__lastSaveAt || 0) > 400) { globalThis.__lastSaveAt = now; savePos() }
+  })
   win.on('closed', () => { win = null })
 
   // 拖动：页面里按下她 → 交给主进程搬窗口（拖动期间用 16ms 快速轮询，跟手）
+  //
+  // ⚠️ 2026-10-01 小鲸修：旧写法是 `if (!win || overPanel) return` —— overPanel 是 90ms
+  //    轮询「上一次」的结果：鼠标按下那一刻它恰好是 panel（或已过期）时，这次拖动就被判给
+  //    网页 → 表现就是「她只在窗口里面移动，整个窗口搬不动」✗
+  //    现在改成在**按下的这一刻**重新探一次命中，真的压在面板上才放行给网页 ✓
   ipcMain.on('drag-start', async (_e, at) => {
-    if (!win) return
-    // ⚠️ 不能直接用 overPanel（那是 90ms 轮询的上一次结果）：
-    // 按下那一刻它恰好是 panel 时，这次拖动就被让给网页，只能在窗口内挪、整个窗口搬不动。
-    // B 站 @F0rsEn 反馈的正是这条。改成「按下瞬间重新判一次」，几十毫秒的等待对拖动没影响。
+    // 本地补丁 v7 ✗→✓：小球用的是同一个 preload，按小球也会发 drag-start；
+    // 而收起时主窗口只是 hide() 并没 destroy() → 原判断会放行，把看不见的主窗口一路搬走 ✗
+    // 所以这里加一条：主窗口"没在显示"就不许搬 ✓
+    if (!win || win.isDestroyed() || !win.isVisible()) return
+    let kind = 'model'
     try {
       const b = win.getBounds()
-      const kind = await win.webContents.executeJavaScript(
-        hitJS(Math.round(at.x - b.x), Math.round(at.y - b.y)),
-      )
-      if (kind === 'panel') return // 真控件（滑块/按钮/输入框）→ 让给网页
+      const p = screen.getCursorScreenPoint()
+      kind = await win.webContents.executeJavaScript(hitJS(Math.round(p.x - b.x), Math.round(p.y - b.y)))
     } catch (e) {}
+    if (kind === 'panel') return
     dragFrom = { mouse: at, win: win.getPosition() }
     clearInterval(dragTimer)
     dragTimer = setInterval(() => {
@@ -215,7 +210,7 @@ function createMain() {
         if (collapsed) expand()
         break
       case 'open-dsh':
-        shell.openExternal(petBase + '/')
+        shell.openExternal(ORIGIN + '/')
         break
       case 'quit':
         app.quit()
@@ -231,84 +226,41 @@ function createMain() {
   })
 }
 
-/**
- * 发现正在运行的 DSH 宿主：官方桌面版（19387）或 `dsh web`（3080）。
- * 带通行证探 /dsh-pet/pet.js：200 = 就是它；401 = 插件在但票不对（也先进去）。
- * 以前写死 3080，导致只开官方桌面版的用户连不上。
- */
-async function discoverHost(token) {
-  let fallback = null
-  // 优先顺序：① 插件写下的真实端口 ② 本机实际在监听的端口（扫出来的） ③ 常见端口兜底
-  const scanned = await scanListeningPorts()
-  const ordered = []
-  const p = deskPort()
-  if (p) ordered.push(p)
-  for (const n of scanned) if (!ordered.includes(n)) ordered.push(n)
-  for (const base of CANDIDATE_BASES) {
-    const n = Number(base.split(':').pop())
-    if (!ordered.includes(n)) ordered.push(n)
-  }
-  const bases = ordered.map((n) => 'http://127.0.0.1:' + n)
-  for (const base of bases) {
-    try {
-      const ctl = new AbortController()
-      const timer = setTimeout(() => ctl.abort(), 1500)
-      const res = await fetch(base + '/dsh-pet/pet.js', {
-        headers: { Cookie: 'dsh_pet_desk=' + token },
-        signal: ctl.signal,
-      })
-      clearTimeout(timer)
-      if (res.status === 200) return base
-      if (res.status === 401 && !fallback) fallback = base
-    } catch (e) {
-      /* 这个宿主没在跑，试下一个 */
-    }
-  }
-  return fallback
-}
-
-async function load() {
+function load() {
   if (!win || win.isDestroyed()) return
-  const ok = await setTokenCookie()
-  if (!ok) return showHint()
-  const token = readToken()
-  const base = token ? await discoverHost(token) : null
-  if (!base) {
-    // 两个宿主都没找到：给提示页，5 秒后自动重试（用户开起任一个宿主就会连上）
-    failCount++
-    if (failCount >= 1) showHint()
-    setTimeout(load, 5000)
-    return
-  }
-  if (base !== petBase) console.log('[dsh-pet] 找到宿主:', base)
-  petBase = base
-  win.loadURL(petURL())
+  setTokenCookie().then((ok) => {
+    if (!ok) return showHint()
+    win.loadURL(PET_URL)
+  })
 }
 
-/** 用 netstat 列出本机正在监听的端口（不靠固定端口去猜 —— 别人的端口可能完全不同） */
-function scanListeningPorts() {
-  return new Promise((resolve) => {
-    try {
-      exec('netstat -ano -p tcp', { timeout: 5000, windowsHide: true }, (err, stdout) => {
-        if (err || !stdout) return resolve([])
-        const ports = []
-        for (const line of String(stdout).split('\n')) {
-          if (!/LISTENING/i.test(line)) continue
-          const m = line.match(/(?:127\.0\.0\.1|0\.0\.0\.0|\[::1?\]|\[::\]):(\d{2,5})/)
-          if (m) {
-            const n = Number(m[1])
-            if (n > 1023 && n < 65536) ports.push(n)
-          }
-        }
-        // 去重 + 常见开发端口排前面（纯优化顺序，不影响正确性）
-        const uniq = [...new Set(ports)]
-        uniq.sort((a, b) => (a === 19387 || a === 3080 ? -1 : 0) - (b === 19387 || b === 3080 ? -1 : 0))
-        resolve(uniq.slice(0, 60))
-      })
-    } catch (e) {
-      resolve([])
-    }
-  })
+// 本地补丁（2026-10-03）：存下来的位置可能落在所有显示器之外 → 窗口"消失"、重启也回不来 ✗
+// 这里要求窗口左上角至少落在某个显示器工作区内 40px，否则视为无效、走默认位置 ✓
+function clampToDisplays(pos) {
+  if (!Array.isArray(pos) || pos.length < 2) return null
+  const [x, y] = pos
+  for (const d of screen.getAllDisplays()) {
+    const w = d.workArea
+    if (x >= w.x && y >= w.y && x + 40 <= w.x + w.width && y + 40 <= w.y + w.height) return [x, y]
+  }
+  return null
+}
+
+// ── 本地补丁（2026-10-03 v3 · 只加护栏）────────────────────────────
+// 之前两次事故都是同一个形态：窗口被推到两块屏中间/屏幕外 → 位置又被写进 pos.json
+// → 重启也回不来 ✗。这里不再动拖动逻辑，只保证"坐标永远落在某块显示器工作区里" ✓
+// 取"离得最近"的那块屏来夹：哪怕点在两屏之间的缝里，也会被拉回最近那块屏的边缘 ✓
+function clampToDisplayUnion(x, y) {
+  let best = null
+  let bestDist = Infinity
+  for (const d of screen.getAllDisplays()) {
+    const w = d.workArea
+    const cx = Math.min(Math.max(x, w.x), w.x + w.width - 40)
+    const cy = Math.min(Math.max(y, w.y), w.y + w.height - 40)
+    const dist = Math.abs(cx - x) + Math.abs(cy - y)
+    if (dist < bestDist) { bestDist = dist; best = [cx, cy] }
+  }
+  return best || [x, y]
 }
 
 function readPos() {
@@ -321,7 +273,9 @@ function readPos() {
 
 function savePos() {
   if (!win || win.isDestroyed()) return
-  const [x, y] = win.getPosition()
+  if (dragTimer) return // 本地补丁 v3：拖动过程中不写盘（每 16ms 一次会把坏位置写进去 ✗）
+  const [x0, y0] = win.getPosition()
+  const [x, y] = clampToDisplayUnion(x0, y0) // 本地补丁 v3：写盘前先夹一次 ✓
   const dir = app.getPath('userData')
   try {
     fs.mkdirSync(dir, { recursive: true })
@@ -344,7 +298,7 @@ function showHint(installed) {
   code{background:rgba(127,150,255,.18);padding:2px 6px;border-radius:6px}
   </style><body><div class="box">
   <div class="t">🐋 正在找 DSH…</div>
-  <div class="s">${token ? '通行证已就位，但连不上 <code>${petBase}</code>。<br>请确认 ① 装了插件 ② DSH 正在运行。' : '还没读到通行证 <code>~/.dsh/dsh-live2d-pet-desktop.json</code>。<br>请先在 DSH 里装插件，然后重启 DSH。'}</div>
+  <div class="s">${token ? '通行证已就位，但连不上 <code>127.0.0.1:3080</code>。<br>请确认 ① 装了插件 ② DSH 正在运行。' : '还没读到通行证 <code>~/.dsh/dsh-live2d-pet-desktop.json</code>。<br>请先在 DSH 里装插件，然后重启 DSH。'}</div>
   <button onclick="window.dshpet.install()">一键安装插件</button>
   <button onclick="window.dshpet.reload()">重新连接</button>
   </div>
@@ -389,7 +343,7 @@ function ballHTML() {
   .ball{width:100%;height:100%;border-radius:50%;box-sizing:border-box;display:flex;align-items:center;justify-content:center;
     background:radial-gradient(120% 120% at 50% 0%, rgba(60,70,96,.98), rgba(16,20,32,.98));
     border:1.5px solid rgba(255,255,255,.34);box-shadow:0 6px 18px rgba(0,0,0,.38);cursor:pointer}
-  .ball:hover{border-color:rgba(255,255,255,.6);transform:scale(1.06)}
+  .ball:hover{border-color:rgba(255,255,255,.6)}   /* 本地补丁 v6：去掉 transform:scale(1.06) ✗ 透明窗口上它会越拖越大 */
   svg{width:58%;height:58%}
   svg path{fill:#fff}
   </style><body><div class="ball">${icon}</div></body>`
@@ -440,8 +394,17 @@ function createBall() {
     `).catch(() => {})
   })
   ipcMain.on('ball-move', (_e, dx, dy) => {
-    if (!ballWin || !dragFrom) return
-    ballWin.setPosition(dragFrom[0] + dx, dragFrom[1] + dy)
+    // 本地补丁 v4：只认自己的 ballDrag；数值不合法就直接忽略（原来读到主窗口的对象会崩 ✗）
+    if (!ballWin || !ballDrag) return
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return
+    // 本地补丁 v6：坐标取整 + 用 setBounds 把尺寸钉回 62×62 ✓
+    //（小数坐标 / 尺寸漂移在透明窗口 + 125% 缩放下会越拖越大 ✗）
+    ballWin.setBounds({
+      x: Math.round(ballDrag[0] + dx),
+      y: Math.round(ballDrag[1] + dy),
+      width: BALL,
+      height: BALL,
+    })
   })
   ipcMain.on('ball-drop', (_e, moved) => {
     if (!ballWin) return
@@ -456,7 +419,8 @@ function snapBall() {
   const [x, y] = ballWin.getPosition()
   const nearest = x + BALL / 2 < wa.x + wa.width / 2 ? wa.x + 4 : wa.x + wa.width - BALL - 4
   const ny = Math.min(Math.max(y, wa.y + 4), wa.y + wa.height - BALL - 4)
-  ballWin.setPosition(nearest, ny)
+  ballWin.setBounds({ x: Math.round(nearest), y: Math.round(ny), width: BALL, height: BALL })   // 本地补丁 v6
+  ballDrag = [Math.round(nearest), Math.round(ny)]   // 本地补丁 v8：贴边后刷新起点，否则下次拖动会从旧位置起算而"闪现"✗
 }
 
 function collapse() {
@@ -471,7 +435,7 @@ function collapse() {
   ballWin.showInactive()
   ballWin.setAlwaysOnTop(true, 'screen-saver')
   win.hide()
-  dragFrom = [ballWin.getPosition()[0], ballWin.getPosition()[1]]
+  ballDrag = [ballWin.getPosition()[0], ballWin.getPosition()[1]]   // 本地补丁 v4：走独立变量 ✓
   setTimeout(snapBall, 30)
 }
 
@@ -479,7 +443,7 @@ function expand() {
   if (!collapsed) return
   collapsed = false
   if (ballWin) {
-    dragFrom = null
+    ballDrag = null   // 本地补丁 v4：只清小球自己的 ✓
     ballWin.hide()
   }
   if (win) {
@@ -515,7 +479,7 @@ function createTray() {
           },
         },
         { label: '一键安装插件（如果还没装）', click: installPlugin },
-        { label: '打开 DSH 界面', click: () => shell.openExternal(petBase + '/') },
+        { label: '打开 DSH 界面', click: () => shell.openExternal(ORIGIN + '/') },
         { type: 'separator' },
         { label: '彻底退出', click: () => app.quit() },
       ]),
